@@ -61,28 +61,42 @@ def parse_movies(html: str) -> Iterable[Movie]:
 
 
 def _parse_movie(item) -> Movie:
-    rank_text = item.select_one(".pic em").get_text(strip=True)
+    def _required_text(selector: str) -> str:
+        tag = item.select_one(selector)
+        if not tag:
+            raise ValueError(f"Missing required element for selector '{selector}'")
+        return tag.get_text(strip=True)
+
+    def _optional_text(selector: str) -> Optional[str]:
+        tag = item.select_one(selector)
+        return tag.get_text(strip=True) if tag else None
+
+    rank_text = _required_text(".pic em")
     rank = int(rank_text)
 
     title_tags = item.select(".info .hd .title")
-    title = title_tags[0].get_text(strip=True) if title_tags else ""
+    title = title_tags[0].get_text(strip=True) if title_tags else _required_text(".info .hd a")
     original_title = title_tags[1].get_text(strip=True) if len(title_tags) > 1 else None
 
     detail_link = item.select_one(".info .hd a")
-    detail_url = detail_link["href"] if detail_link else ""
+    if not detail_link or not detail_link.get("href"):
+        raise ValueError("Missing detail URL")
+    detail_url = detail_link["href"]
 
     poster_tag = item.select_one(".pic img")
-    poster_url = poster_tag["src"] if poster_tag else ""
+    poster_url = poster_tag.get("src") if poster_tag and poster_tag.get("src") else ""
 
-    rating_text = item.select_one(".star .rating_num").get_text(strip=True)
+    rating_text = _required_text(".star .rating_num")
     rating = float(rating_text)
 
-    rating_people_text = item.select(".star span")[-1].get_text(strip=True)
+    rating_spans = item.select(".star span")
+    if not rating_spans:
+        raise ValueError("Missing rating count")
+    rating_people_text = rating_spans[-1].get_text(strip=True)
     rating_count_match = re.search(r"(\d+)", rating_people_text.replace(",", ""))
     rating_count = int(rating_count_match.group(1)) if rating_count_match else 0
 
-    quote_tag = item.select_one(".info .bd .inq")
-    quote = quote_tag.get_text(strip=True) if quote_tag else None
+    quote = _optional_text(".info .bd .inq")
 
     info_block = item.select_one(".info .bd p")
     directors: List[str] = []
