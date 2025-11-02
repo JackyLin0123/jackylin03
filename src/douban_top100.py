@@ -1,22 +1,27 @@
-"""Scrape Douban Top 100 movies and persist them into a SQLite database."""
+"""Scrape Douban Top 250 movies and persist them into a MySQL database."""
 from __future__ import annotations
 
 import argparse
 import logging
 import re
-import sqlite3
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterable, List, Optional
 
 import requests
 from bs4 import BeautifulSoup
+import mysql.connector
+from mysql.connector import errorcode
 
 
 BASE_URL = "https://movie.douban.com/top250"
-DEFAULT_DB_PATH = Path("data/douban_top100.sqlite3")
+DEFAULT_DB_NAME = "douban_top250"
+DEFAULT_DB_USER = "root"
+DEFAULT_DB_HOST = "localhost"
+DEFAULT_DB_PORT = 3306
+PAGE_SIZE = 25
+DEFAULT_LIMIT = 250
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -167,55 +172,65 @@ def _parse_meta(meta_line: str) -> tuple[Optional[int], List[str], List[str]]:
     return year, regions, genres
 
 
-def init_db(connection: sqlite3.Connection) -> None:
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.executescript(
+def init_db(connection) -> None:
+    cursor = connection.cursor()
+    statements = [
         """
         CREATE TABLE IF NOT EXISTS movies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            rank INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            original_title TEXT,
-            year INTEGER,
-            rating REAL NOT NULL,
-            rating_count INTEGER NOT NULL,
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            rank INT NOT NULL,
+            title VARCHAR(255) NOT NULL,
+            original_title VARCHAR(255),
+            year INT,
+            rating DECIMAL(3,1) NOT NULL,
+            rating_count INT NOT NULL,
             quote TEXT,
-            poster_url TEXT,
-            detail_url TEXT NOT NULL UNIQUE
-        );
-
+            poster_url VARCHAR(500),
+            detail_url VARCHAR(255) NOT NULL UNIQUE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
         CREATE TABLE IF NOT EXISTS movie_regions (
-            movie_id INTEGER NOT NULL,
-            region TEXT NOT NULL,
+            movie_id INT NOT NULL,
+            region VARCHAR(255) NOT NULL,
             PRIMARY KEY (movie_id, region),
             FOREIGN KEY (movie_id) REFERENCES movies(id) ON DELETE CASCADE
-        );
-
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
         CREATE TABLE IF NOT EXISTS movie_genres (
-            movie_id INTEGER NOT NULL,
-            genre TEXT NOT NULL,
+            movie_id INT NOT NULL,
+            genre VARCHAR(255) NOT NULL,
             PRIMARY KEY (movie_id, genre),
             FOREIGN KEY (movie_id) REFERENCES movies(id) ON DELETE CASCADE
-        );
-
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
         CREATE TABLE IF NOT EXISTS movie_directors (
-            movie_id INTEGER NOT NULL,
-            director TEXT NOT NULL,
+            movie_id INT NOT NULL,
+            director VARCHAR(255) NOT NULL,
             PRIMARY KEY (movie_id, director),
             FOREIGN KEY (movie_id) REFERENCES movies(id) ON DELETE CASCADE
-        );
-
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
         CREATE TABLE IF NOT EXISTS movie_actors (
-            movie_id INTEGER NOT NULL,
-            actor TEXT NOT NULL,
+            movie_id INT NOT NULL,
+            actor VARCHAR(255) NOT NULL,
             PRIMARY KEY (movie_id, actor),
             FOREIGN KEY (movie_id) REFERENCES movies(id) ON DELETE CASCADE
-        );
-        """
-    )
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+    ]
+
+    for statement in statements:
+        cursor.execute(statement)
+
+    cursor.close()
+    connection.commit()
 
 
-def store_movies(connection: sqlite3.Connection, movies: Iterable[Movie]) -> None:
+def store_movies(connection, movies: Iterable[Movie]) -> None:
     cursor = connection.cursor()
     for movie in movies:
         cursor.execute(
@@ -223,16 +238,16 @@ def store_movies(connection: sqlite3.Connection, movies: Iterable[Movie]) -> Non
             INSERT INTO movies (
                 rank, title, original_title, year, rating, rating_count,
                 quote, poster_url, detail_url
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(detail_url) DO UPDATE SET
-                rank=excluded.rank,
-                title=excluded.title,
-                original_title=excluded.original_title,
-                year=excluded.year,
-                rating=excluded.rating,
-                rating_count=excluded.rating_count,
-                quote=excluded.quote,
-                poster_url=excluded.poster_url
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                rank=VALUES(rank),
+                title=VALUES(title),
+                original_title=VALUES(original_title),
+                year=VALUES(year),
+                rating=VALUES(rating),
+                rating_count=VALUES(rating_count),
+                quote=VALUES(quote),
+                poster_url=VALUES(poster_url)
             """,
             (
                 movie.rank,
@@ -249,7 +264,7 @@ def store_movies(connection: sqlite3.Connection, movies: Iterable[Movie]) -> Non
 
         movie_id = cursor.lastrowid
         if not movie_id:
-            cursor.execute("SELECT id FROM movies WHERE detail_url = ?", (movie.detail_url,))
+            cursor.execute("SELECT id FROM movies WHERE detail_url = %s", (movie.detail_url,))
             row = cursor.fetchone()
             if not row:
                 raise RuntimeError(f"Failed to retrieve movie id for {movie.title}")
@@ -261,49 +276,146 @@ def store_movies(connection: sqlite3.Connection, movies: Iterable[Movie]) -> Non
         _replace_values(cursor, "movie_actors", movie_id, "actor", movie.actors)
 
     connection.commit()
+    cursor.close()
 
 
-def _replace_values(cursor: sqlite3.Cursor, table: str, movie_id: int, column: str, values: Iterable[str]) -> None:
-    cursor.execute(f"DELETE FROM {table} WHERE movie_id = ?", (movie_id,))
+def _replace_values(cursor, table: str, movie_id: int, column: str, values: Iterable[str]) -> None:
+    cursor.execute(f"DELETE FROM {table} WHERE movie_id = %s", (movie_id,))
+    values = list(values)
+    if not values:
+        return
     cursor.executemany(
-        f"INSERT INTO {table} (movie_id, {column}) VALUES (?, ?)",
-        ((movie_id, value) for value in values),
+        f"INSERT INTO {table} (movie_id, {column}) VALUES (%s, %s)",
+        [(movie_id, value) for value in values],
     )
 
 
-def scrape_top100(delay: float = 0.5) -> List[Movie]:
+def scrape_top_movies(limit: int = DEFAULT_LIMIT, delay: float = 0.5) -> List[Movie]:
+    if limit <= 0:
+        logging.warning("Requested limit %s is not positive; defaulting to %s", limit, DEFAULT_LIMIT)
+        limit = DEFAULT_LIMIT
+
+    limit = min(limit, DEFAULT_LIMIT)
+
     movies: List[Movie] = []
     with requests.Session() as session:
-        for start in range(0, 100, 25):
+        for start in range(0, max(limit, PAGE_SIZE), PAGE_SIZE):
             html = fetch_html(start, session=session)
-            movies.extend(parse_movies(html))
-            logging.info("Fetched movies %s-%s", start + 1, start + 25)
+            page_movies = list(parse_movies(html))
+            if not page_movies:
+                logging.warning("No movies returned for start=%s; stopping early", start)
+                break
+
+            movies.extend(page_movies)
+            logging.info(
+                "Fetched movies %s-%s", start + 1, start + len(page_movies)
+            )
+
+            if len(movies) >= limit:
+                break
+
             if delay:
                 time.sleep(delay)
-    return movies[:100]
+
+    return movies[:limit]
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", "-d", type=Path, default=DEFAULT_DB_PATH, help="Path to the SQLite database file")
+    parser.add_argument("--host", default=DEFAULT_DB_HOST, help="MySQL host name")
+    parser.add_argument("--port", type=int, default=DEFAULT_DB_PORT, help="MySQL port")
+    parser.add_argument("--user", default=DEFAULT_DB_USER, help="MySQL user")
+    parser.add_argument("--password", default="", help="MySQL password")
+    parser.add_argument(
+        "--database",
+        "-d",
+        default=DEFAULT_DB_NAME,
+        help="MySQL database to store scraped data",
+    )
+    parser.add_argument(
+        "--create-database",
+        action="store_true",
+        help="Create the target database if it does not already exist",
+    )
     parser.add_argument("--delay", type=float, default=0.5, help="Delay in seconds between requests")
+    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="Number of top movies to scrape (max 250)")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
 
-    if args.database.parent and not args.database.parent.exists():
-        args.database.parent.mkdir(parents=True, exist_ok=True)
-
-    movies = scrape_top100(delay=args.delay)
+    movies = scrape_top_movies(limit=args.limit, delay=args.delay)
     logging.info("Parsed %d movies", len(movies))
 
-    with sqlite3.connect(args.database) as connection:
+    try:
+        connection = connect_to_database(
+            host=args.host,
+            port=args.port,
+            user=args.user,
+            password=args.password,
+            database=args.database,
+            create_database=args.create_database,
+        )
+    except mysql.connector.Error as exc:
+        logging.error("Failed to connect to MySQL: %s", exc)
+        return 1
+
+    try:
         init_db(connection)
         store_movies(connection, movies)
+    finally:
+        connection.close()
 
-    logging.info("Stored movies in %s", args.database)
+    logging.info("Stored movies in MySQL database '%s'", args.database)
     return 0
+
+
+def connect_to_database(
+    *,
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    database: str,
+    create_database: bool,
+):
+    try:
+        return mysql.connector.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database,
+            autocommit=False,
+        )
+    except mysql.connector.Error as exc:
+        if exc.errno != errorcode.ER_BAD_DB_ERROR or not create_database:
+            raise
+
+    admin_connection = mysql.connector.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+    )
+
+    admin_cursor = admin_connection.cursor()
+    try:
+        admin_cursor.execute(
+            f"CREATE DATABASE IF NOT EXISTS `{database}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+        )
+    finally:
+        admin_cursor.close()
+        admin_connection.close()
+
+    return mysql.connector.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        autocommit=False,
+    )
 
 
 if __name__ == "__main__":
